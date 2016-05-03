@@ -1,10 +1,17 @@
 #!/usr/bin/python
 # phantom.py
 
-import logging
+import os, logging
 from struct import *
-from phantom_server import *
+from config import *
+from phantom_network import *
 from gpio_managers import *
+
+logging.basicConfig(level=logging.DEBUG,
+        filename=APP_LOGFILE,
+        filemode="w+",
+        format='[%(levelname)5s](%(threadName)-s) %(message)s',
+        )
 
 FORWARD_SIGNAL = 0xF0
 REVERSE_SIGNAL = 0xF1
@@ -16,14 +23,15 @@ SYSTEM_CMD_SIGNAL = 0xD0
 DEBUG_TEXT = 0x10
 DEBUG_INT = 0x11
 
+
 class Phantom(object):
 
-    def __init__(self, config):
-        self.__init_logger()
-        self.server = PhantomServer(self.logger, config.HOST, config.PORT)
-        self.motor_manager = MotorManager(self.logger, config)
-        self.ultra_sensor_manager = None
-        self.logger.info("Phantom done init")
+    def __init__(self):
+        init_gpio_pins()
+        self.network = PhantomNetwork()
+        self.motorMgr = MotorManager()
+        self.ultrasonicMgr = UltrasonicManager(self.motorMgr.stop_movement)
+        logging.info("Initialization completed.")
 
     # with-statement support
     def __enter__(self):
@@ -31,95 +39,102 @@ class Phantom(object):
 
     # with-statement support
     def __exit__(self, type, value, traceback):
-        self.close()
+        self.shutdown()
 
     def start(self):
+        # Block until a remote device is connected
+        self.network.start()
+        self.motorMgr.start()
+        self.ultrasonicMgr.start()
         self.run()
 
     def run(self):
-        self.server.wait_for_client()
-
-        self.running = True
-        while self.running:
-            response_pkt = None
-            recv_pkt = self.server.receive()
-
-            if recv_pkt is None:
-                self.logger.info("Shutting down ...")
-                self.running = False
+        # Main Loop
+        warningSent = False
+        logging.debug("Entering Main Loop")
+        while True:
+            # Check errors
+            if not self.network.is_running():
                 break
-            elif recv_pkt[3:] == 'close':
-                self.logger.info("close request received, now shutting down ...")
-                self.running = False
-                break
+            if hazard_detected():
+                if not warningSent:
+                    warningSent = True
+                    msg = "Hazard Detected!"
+                    newPkt = pack("!hB%ds" % (len(msg)), len(msg), DEBUG_TEXT, msg)
+                    self.network.deliver_packet(newPkt)
             else:
-                self.logger.debug("Packet received (%d bytes):", len(recv_pkt))
-                req_param, req_type = unpack("!hB", recv_pkt[0:3])
-                self.logger.debug("\tPacket Header:%s", (req_param, req_type))
-                self.logger.debug("\tPacket Data:%s", recv_pkt[3:])
+                warningSent = False
 
-                response_pkt = self.__handle_request(req_type, req_param)
+            # Get packet from recvQ
+            packet = self.network.pickup_packet(blocking=False, timeout=0.05)
+            if packet is None:
+                continue
 
-            if response_pkt is not None:
-                self.server.send(response_pkt)
+            # Unpack packet
+            data_size, signal = unpack("!hB", packet[0:3])
+            data = packet[3:]
+            logging.debug("Header:%s\tData:%s", (data_size, signal), data)
+
+            # Process packet
+            self.handle_signal(signal, data)
 
 
-    def close(self):
-        self.server.close()
+    def handle_signal(self, signal, data):
+        reply_type = DEBUG_TEXT
+        reply = ""
+
+        if signal == FORWARD_SIGNAL:
+            reply = "FORWARD_SIGNAL received"
+            self.motorMgr.move_forward()
+
+        elif signal == REVERSE_SIGNAL:
+            reply = "REVERSE_SIGNAL received"
+            self.motorMgr.move_backward()
+
+        elif signal == LEFT_SIGNAL:
+            reply = "LEFT_SIGNAL received"
+            self.motorMgr.turn_left()
+
+        elif signal == RIGHT_SIGNAL:
+            reply = "RIGHT_SIGNAL received"
+            self.motorMgr.turn_right()
+
+        elif signal == STOP_SIGNAL:
+            reply = "STOP_SIGNAL received"
+            self.motorMgr.stop_movement()
+
+        elif signal == SHUTDOWN_SIGNAL:
+            reply = "SHUTDOWN_SIGNAL received"
+        elif signal == SYSTEM_CMD_SIGNAL:
+            reply = "SYSTEM_CMD_SIGNAL received"
+        elif signal == DEBUG_TEXT:
+            reply = "DEBUG_TEXT received"
+        elif signal == DEBUG_INT:
+            reply = "DEBUG_INT received"
+        else:
+            reply = "Unknown Request Type %d" % signal
+            logging.error(reply)
+
+        newPkt = pack("!hB%ds" % (len(reply)), len(reply), reply_type, reply)
+        self.network.deliver_packet(newPkt)
+
+    def shutdown(self):
+        logging.warning("shutting down ...")
+        self.network.shutdown()
+        self.motorMgr.shutdown()
+        self.ultrasonicMgr.shutdown()
+        reset_gpio_pins()
         logging.shutdown()
 
-    def __init_logger(self):
-        self.logger = logging.getLogger(__name__)
-        self.logger.setLevel(logging.DEBUG)
-        # create file handler which logs even debug messages
-        fh = logging.FileHandler('phantom.log')
-        fh.setLevel(logging.DEBUG)
-        # create console handler with a higher log level
-        ch = logging.StreamHandler()
-        ch.setLevel(logging.DEBUG)
-        # create formatter and add it to the handlers
-        formatter = logging.Formatter('%(asctime)s %(levelname)s:%(message)s')
-        fh.setFormatter(formatter)
-        ch.setFormatter(formatter)
-        # add the handlers to the logger
-        self.logger.addHandler(fh)
-        self.logger.addHandler(ch)
+if __name__ == '__main__':
 
-    def __handle_request(self, req_type, req_param):
-        resp_type = DEBUG_TEXT
-        resp_msg = ""
+    logging.info("Machine Info: Host=%s, Port=%d", PhantomNetwork.LOCAL_HOST, NETWORK_PORT)
 
-        if req_type == FORWARD_SIGNAL:
-            resp_msg = "FORWARD_SIGNAL received"
-            self.motor_manager.move_forward()
+    with Phantom() as phantom:
+        try:
+            phantom.start()
+        except KeyboardInterrupt:
+            logging.warning("Keyboard Interrupt.")
 
-        elif req_type == REVERSE_SIGNAL:
-            resp_msg = "REVERSE_SIGNAL received"
-            self.motor_manager.move_backward()
-
-        elif req_type == LEFT_SIGNAL:
-            resp_msg = "LEFT_SIGNAL received"
-            self.motor_manager.turn_left()
-
-        elif req_type == RIGHT_SIGNAL:
-            resp_msg = "RIGHT_SIGNAL received"
-            self.motor_manager.turn_right()
-
-        elif req_type == STOP_SIGNAL:
-            resp_msg = "STOP_SIGNAL received"
-            self.motor_manager.stop_movement()
-
-        elif req_type == SHUTDOWN_SIGNAL:
-            resp_msg = "SHUTDOWN_SIGNAL received"
-        elif req_type == SYSTEM_CMD_SIGNAL:
-            resp_msg = "SYSTEM_CMD_SIGNAL received"
-        elif req_type == DEBUG_TEXT:
-            resp_msg = "DEBUG_TEXT received"
-        elif req_type == DEBUG_INT:
-            resp_msg = "DEBUG_INT received"
-        else:
-            resp_msg = "Unknown Request Type %d" % req_type
-            self.logger.error(resp_msg)
-
-        print "resp_type:", resp_type, ", resp_msg:", resp_msg
-        return pack("!hB%ds" % (len(resp_msg)), len(resp_msg), resp_type, resp_msg)
+    os._exit(0)
+    print "Terminated"
